@@ -181,8 +181,28 @@ func (w *VideoWorker) StartProcessing(ctx context.Context, subscriptionID string
 	})
 }
 
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
 func main() {
 	ctx := context.Background()
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	// Start HTTP server for health checks
+	go func() {
+		http.HandleFunc("/health", healthCheckHandler)
+		http.HandleFunc("/", healthCheckHandler)
+		log.Printf("Starting HTTP server on port %s", port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Fatalf("Failed to start HTTP server: %v", err)
+		}
+	}()
 
 	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT_ID")
 	credentialsPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
