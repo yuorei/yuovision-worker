@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -85,13 +87,38 @@ func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessa
 }
 
 func (w *VideoWorker) downloadVideo(sourceURL, outputPath string) error {
-	// Implementation would download from R2 using signed URL
 	log.Printf("Downloading video from: %s to: %s", sourceURL, outputPath)
+
+	resp, err := http.Get(sourceURL)
+	if err != nil {
+		return fmt.Errorf("failed to download video: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download video: HTTP %d", resp.StatusCode)
+	}
+
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer outFile.Close()
+
+	_, err = io.Copy(outFile, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write video file: %w", err)
+	}
+
+	log.Printf("Successfully downloaded video to: %s", outputPath)
 	return nil
 }
 
 func (w *VideoWorker) convertToHLS(inputPath, outputDir string) error {
-	// Use FFmpeg to convert video to HLS format
+	if _, err := os.Stat(inputPath); os.IsNotExist(err) {
+		return fmt.Errorf("input file does not exist: %s", inputPath)
+	}
+
 	playlistPath := filepath.Join(outputDir, "playlist.m3u8")
 
 	cmd := exec.Command("ffmpeg",
@@ -113,7 +140,10 @@ func (w *VideoWorker) convertToHLS(inputPath, outputDir string) error {
 }
 
 func (w *VideoWorker) generateThumbnail(inputPath, outputPath string) error {
-	// Generate thumbnail using FFmpeg
+	if _, err := os.Stat(inputPath); os.IsNotExist(err) {
+		return fmt.Errorf("input file does not exist: %s", inputPath)
+	}
+
 	cmd := exec.Command("ffmpeg",
 		"-i", inputPath,
 		"-ss", "00:00:01.000",
