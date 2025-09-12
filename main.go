@@ -57,6 +57,7 @@ type VideoWorker struct {
 	r2Client        *s3.Client
 	projectID       string
 	r2BucketName    string
+	r2AccountID     string
 }
 
 func NewVideoWorker(ctx context.Context, projectID, credentialsPath, r2AccountID, r2AccessKey, r2SecretKey, r2BucketName string) (*VideoWorker, error) {
@@ -109,37 +110,24 @@ func NewVideoWorker(ctx context.Context, projectID, credentialsPath, r2AccountID
 		r2Client:        r2Client,
 		projectID:       projectID,
 		r2BucketName:    r2BucketName,
+		r2AccountID:     r2AccountID,
 	}, nil
 }
 
 func (w *VideoWorker) updateProcessingStatus(ctx context.Context, processingID string, status VideoProcessingStatus, progress int, message *string) error {
 	docRef := w.firestoreClient.Collection("video_processing").Doc(processingID)
 
-	updateData := map[string]interface{}{
-		"status":     string(status),
-		"progress":   progress,
-		"updated_at": time.Now(),
-	}
-
-	if message != nil {
-		updateData["message"] = *message
-	}
-
-	_, err := docRef.Update(ctx, []firestore.Update{
+	updates := []firestore.Update{
 		{Path: "status", Value: string(status)},
 		{Path: "progress", Value: progress},
 		{Path: "updated_at", Value: time.Now()},
-	})
-
-	if message != nil {
-		_, err = docRef.Update(ctx, []firestore.Update{
-			{Path: "status", Value: string(status)},
-			{Path: "progress", Value: progress},
-			{Path: "message", Value: *message},
-			{Path: "updated_at", Value: time.Now()},
-		})
 	}
 
+	if message != nil {
+		updates = append(updates, firestore.Update{Path: "message", Value: *message})
+	}
+
+	_, err := docRef.Update(ctx, updates)
 	if err != nil {
 		return fmt.Errorf("failed to update processing status: %w", err)
 	}
@@ -328,8 +316,8 @@ func (w *VideoWorker) uploadHLSFiles(ctx context.Context, hlsDir, hlsPrefix stri
 func (w *VideoWorker) updateVideoWithProcessedURLs(ctx context.Context, videoID, hlsPrefix string) error {
 	videoDocRef := w.firestoreClient.Collection("videos").Doc(videoID)
 
-	// HLS playlist URL
-	playlistURL := fmt.Sprintf("https://%s/%splaylist.m3u8", w.r2BucketName, hlsPrefix)
+	// HLS playlist URL with proper R2 format
+	playlistURL := fmt.Sprintf("https://%s.%s.r2.cloudflarestorage.com/%splaylist.m3u8", w.r2BucketName, w.r2AccountID, hlsPrefix)
 
 	_, err := videoDocRef.Update(ctx, []firestore.Update{
 		{Path: "video_url", Value: playlistURL},
