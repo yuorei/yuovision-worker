@@ -10,94 +10,155 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
+	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/pubsub"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"google.golang.org/api/option"
 )
 
 type VideoProcessingMessage struct {
-	VideoID   string `json:"video_id"`
-	SourceURL string `json:"source_url"`
-	UserID    string `json:"user_id"`
+	VideoID          string `json:"video_id"`
+	VideoKey         string `json:"video_key"`
+	ProcessingID     string `json:"processing_id"`
+	UploaderID       string `json:"uploader_id"`
+	Title            string `json:"title"`
+	IsPrivate        bool   `json:"is_private"`
+	IsAdult          bool   `json:"is_adult"`
+	IsExternalCutout bool   `json:"is_external_cutout"`
+}
+
+type VideoProcessingStatus string
+
+const (
+	VideoProcessingStatusUploaded   VideoProcessingStatus = "UPLOADED"
+	VideoProcessingStatusProcessing VideoProcessingStatus = "PROCESSING"
+	VideoProcessingStatusCompleted  VideoProcessingStatus = "COMPLETED"
+	VideoProcessingStatusFailed     VideoProcessingStatus = "FAILED"
+)
+
+type VideoProcessingInfo struct {
+	ID        string
+	VideoID   string
+	Status    VideoProcessingStatus
+	Progress  int
+	Message   *string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 type VideoWorker struct {
-	pubsubClient *pubsub.Client
-	projectID    string
+	pubsubClient    *pubsub.Client
+	firestoreClient *firestore.Client
+	r2Client        *s3.Client
+	projectID       string
+	r2BucketName    string
 }
 
-func NewVideoWorker(ctx context.Context, projectID, credentialsPath string) (*VideoWorker, error) {
-	var client *pubsub.Client
+func NewVideoWorker(ctx context.Context, projectID, credentialsPath, r2AccountID, r2AccessKey, r2SecretKey, r2BucketName string) (*VideoWorker, error) {
+	// Initialize Pub/Sub client
+	var pubsubClient *pubsub.Client
 	var err error
 
 	if credentialsPath != "" {
-		client, err = pubsub.NewClient(ctx, projectID, option.WithCredentialsFile(credentialsPath))
+		pubsubClient, err = pubsub.NewClient(ctx, projectID, option.WithCredentialsFile(credentialsPath))
 	} else {
-		client, err = pubsub.NewClient(ctx, projectID)
+		pubsubClient, err = pubsub.NewClient(ctx, projectID)
 	}
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pub/sub client: %w", err)
 	}
 
+	// Initialize Firestore client
+	var firestoreClient *firestore.Client
+	if credentialsPath != "" {
+		firestoreClient, err = firestore.NewClient(ctx, projectID, option.WithCredentialsFile(credentialsPath))
+	} else {
+		firestoreClient, err = firestore.NewClient(ctx, projectID)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create firestore client: %w", err)
+	}
+
+	// Initialize R2 client
+	r2Endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", r2AccountID)
+	r2Resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{URL: r2Endpoint}, nil
+	})
+
+	awsCfg, err := config.LoadDefaultConfig(ctx,
+		config.WithEndpointResolverWithOptions(r2Resolver),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(r2AccessKey, r2SecretKey, "")),
+		config.WithRegion("auto"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config for R2: %w", err)
+	}
+
+	r2Client := s3.NewFromConfig(awsCfg)
+
 	return &VideoWorker{
-		pubsubClient: client,
-		projectID:    projectID,
+		pubsubClient:    pubsubClient,
+		firestoreClient: firestoreClient,
+		r2Client:        r2Client,
+		projectID:       projectID,
+		r2BucketName:    r2BucketName,
 	}, nil
 }
 
-func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessage) error {
-	log.Printf("Processing video: %s for user: %s", msg.VideoID, msg.UserID)
+func (w *VideoWorker) updateProcessingStatus(ctx context.Context, processingID string, status VideoProcessingStatus, progress int, message *string) error {
+	docRef := w.firestoreClient.Collection("video_processing").Doc(processingID)
 
-	// Create temporary directory for processing
-	tempDir := fmt.Sprintf("/tmp/video_%s", msg.VideoID)
-	if err := os.MkdirAll(tempDir, 0755); err != nil {
-		return fmt.Errorf("failed to create temp directory: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	// Download source video
-	inputPath := filepath.Join(tempDir, "input.mp4")
-	if err := w.downloadVideo(msg.SourceURL, inputPath); err != nil {
-		return fmt.Errorf("failed to download video: %w", err)
+	updateData := map[string]interface{}{
+		"status":     string(status),
+		"progress":   progress,
+		"updated_at": time.Now(),
 	}
 
-	// Process video to HLS
-	outputDir := filepath.Join(tempDir, "hls")
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
+	if message != nil {
+		updateData["message"] = *message
 	}
 
-	if err := w.convertToHLS(inputPath, outputDir); err != nil {
-		return fmt.Errorf("failed to convert to HLS: %w", err)
+	_, err := docRef.Update(ctx, []firestore.Update{
+		{Path: "status", Value: string(status)},
+		{Path: "progress", Value: progress},
+		{Path: "updated_at", Value: time.Now()},
+	})
+
+	if message != nil {
+		_, err = docRef.Update(ctx, []firestore.Update{
+			{Path: "status", Value: string(status)},
+			{Path: "progress", Value: progress},
+			{Path: "message", Value: *message},
+			{Path: "updated_at", Value: time.Now()},
+		})
 	}
 
-	// Generate thumbnail
-	thumbnailPath := filepath.Join(tempDir, "thumbnail.jpg")
-	if err := w.generateThumbnail(inputPath, thumbnailPath); err != nil {
-		return fmt.Errorf("failed to generate thumbnail: %w", err)
+	if err != nil {
+		return fmt.Errorf("failed to update processing status: %w", err)
 	}
 
-	// Upload processed files to R2 (this would be implemented)
-	log.Printf("Video processing completed for: %s", msg.VideoID)
-
-	// Update Firestore with completed status (this would be implemented)
-
+	log.Printf("Updated processing status for %s: %s (%d%%)", processingID, status, progress)
 	return nil
 }
 
-func (w *VideoWorker) downloadVideo(sourceURL, outputPath string) error {
-	log.Printf("Downloading video from: %s to: %s", sourceURL, outputPath)
+func (w *VideoWorker) downloadFromR2(ctx context.Context, key, outputPath string) error {
+	log.Printf("Downloading from R2: %s to %s", key, outputPath)
 
-	resp, err := http.Get(sourceURL)
+	result, err := w.r2Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(w.r2BucketName),
+		Key:    aws.String(key),
+	})
 	if err != nil {
-		return fmt.Errorf("failed to download video: %w", err)
+		return fmt.Errorf("failed to get object from R2: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to download video: HTTP %d", resp.StatusCode)
-	}
+	defer result.Body.Close()
 
 	outFile, err := os.Create(outputPath)
 	if err != nil {
@@ -105,12 +166,181 @@ func (w *VideoWorker) downloadVideo(sourceURL, outputPath string) error {
 	}
 	defer outFile.Close()
 
-	_, err = io.Copy(outFile, resp.Body)
+	_, err = io.Copy(outFile, result.Body)
 	if err != nil {
-		return fmt.Errorf("failed to write video file: %w", err)
+		return fmt.Errorf("failed to write file: %w", err)
 	}
 
-	log.Printf("Successfully downloaded video to: %s", outputPath)
+	log.Printf("Successfully downloaded from R2: %s", outputPath)
+	return nil
+}
+
+func (w *VideoWorker) uploadToR2(ctx context.Context, filePath, key, contentType string) error {
+	log.Printf("Uploading to R2: %s as %s", filePath, key)
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	_, err = w.r2Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(w.r2BucketName),
+		Key:         aws.String(key),
+		Body:        file,
+		ContentType: aws.String(contentType),
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to upload to R2: %w", err)
+	}
+
+	log.Printf("Successfully uploaded to R2: %s", key)
+	return nil
+}
+
+func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessage) error {
+	log.Printf("Processing video: %s (ProcessingID: %s) for user: %s", msg.VideoID, msg.ProcessingID, msg.UploaderID)
+
+	// Update status to PROCESSING
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusProcessing, 10, nil); err != nil {
+		log.Printf("Failed to update status to PROCESSING: %v", err)
+	}
+
+	// Create temporary directory for processing
+	tempDir := fmt.Sprintf("/tmp/video_%s", msg.VideoID)
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		errMsg := fmt.Sprintf("Failed to create temp directory: %v", err)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 0, &errMsg)
+		return fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Download source video from R2
+	inputPath := filepath.Join(tempDir, "input.mp4")
+	if err := w.downloadFromR2(ctx, msg.VideoKey, inputPath); err != nil {
+		errMsg := fmt.Sprintf("Failed to download video: %v", err)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 10, &errMsg)
+		return fmt.Errorf("failed to download video: %w", err)
+	}
+
+	// Update progress
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusProcessing, 25, nil); err != nil {
+		log.Printf("Failed to update progress: %v", err)
+	}
+
+	// Process video to HLS
+	outputDir := filepath.Join(tempDir, "hls")
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		errMsg := fmt.Sprintf("Failed to create output directory: %v", err)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 25, &errMsg)
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	if err := w.convertToHLS(inputPath, outputDir); err != nil {
+		errMsg := fmt.Sprintf("Failed to convert to HLS: %v", err)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 40, &errMsg)
+		return fmt.Errorf("failed to convert to HLS: %w", err)
+	}
+
+	// Update progress
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusProcessing, 70, nil); err != nil {
+		log.Printf("Failed to update progress: %v", err)
+	}
+
+	// Generate thumbnail
+	thumbnailPath := filepath.Join(tempDir, "thumbnail.jpg")
+	if err := w.generateThumbnail(inputPath, thumbnailPath); err != nil {
+		log.Printf("Failed to generate thumbnail (non-fatal): %v", err)
+		// Don't fail the entire process for thumbnail generation
+	}
+
+	// Update progress
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusProcessing, 80, nil); err != nil {
+		log.Printf("Failed to update progress: %v", err)
+	}
+
+	// Upload HLS files to R2
+	hlsPrefix := fmt.Sprintf("videos/%s/hls/", msg.VideoID)
+	if err := w.uploadHLSFiles(ctx, outputDir, hlsPrefix); err != nil {
+		errMsg := fmt.Sprintf("Failed to upload HLS files: %v", err)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 80, &errMsg)
+		return fmt.Errorf("failed to upload HLS files: %w", err)
+	}
+
+	// Upload thumbnail if generated successfully
+	if _, err := os.Stat(thumbnailPath); err == nil {
+		thumbnailKey := fmt.Sprintf("videos/%s/thumbnail.jpg", msg.VideoID)
+		if err := w.uploadToR2(ctx, thumbnailPath, thumbnailKey, "image/jpeg"); err != nil {
+			log.Printf("Failed to upload thumbnail (non-fatal): %v", err)
+		}
+	}
+
+	// Update Firestore video record with processed URLs
+	if err := w.updateVideoWithProcessedURLs(ctx, msg.VideoID, hlsPrefix); err != nil {
+		log.Printf("Failed to update video URLs: %v", err)
+		// Don't fail the processing, but log the error
+	}
+
+	// Update status to COMPLETED
+	successMsg := "Video processing completed successfully"
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusCompleted, 100, &successMsg); err != nil {
+		log.Printf("Failed to update status to COMPLETED: %v", err)
+	}
+
+	log.Printf("Video processing completed for: %s", msg.VideoID)
+	return nil
+}
+
+func (w *VideoWorker) uploadHLSFiles(ctx context.Context, hlsDir, hlsPrefix string) error {
+	return filepath.Walk(hlsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(hlsDir, path)
+		if err != nil {
+			return err
+		}
+
+		s3Key := hlsPrefix + relPath
+
+		// Determine content type
+		contentType := "application/octet-stream"
+		if filepath.Ext(relPath) == ".m3u8" {
+			contentType = "application/x-mpegURL"
+		} else if filepath.Ext(relPath) == ".ts" {
+			contentType = "video/MP2T"
+		}
+
+		if err := w.uploadToR2(ctx, path, s3Key, contentType); err != nil {
+			return fmt.Errorf("failed to upload %s: %w", relPath, err)
+		}
+
+		return nil
+	})
+}
+
+func (w *VideoWorker) updateVideoWithProcessedURLs(ctx context.Context, videoID, hlsPrefix string) error {
+	videoDocRef := w.firestoreClient.Collection("videos").Doc(videoID)
+
+	// HLS playlist URL
+	playlistURL := fmt.Sprintf("https://%s/%splaylist.m3u8", w.r2BucketName, hlsPrefix)
+
+	_, err := videoDocRef.Update(ctx, []firestore.Update{
+		{Path: "video_url", Value: playlistURL},
+		{Path: "updated_at", Value: time.Now()},
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to update video URLs in Firestore: %w", err)
+	}
+
+	log.Printf("Updated video %s with HLS URL: %s", videoID, playlistURL)
 	return nil
 }
 
@@ -207,6 +437,10 @@ func main() {
 	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT_ID")
 	credentialsPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
 	subscriptionID := os.Getenv("PUBSUB_SUBSCRIPTION_ID")
+	r2AccountID := os.Getenv("R2_ACCOUNT_ID")
+	r2AccessKey := os.Getenv("R2_ACCESS_KEY_ID")
+	r2SecretKey := os.Getenv("R2_SECRET_ACCESS_KEY")
+	r2BucketName := os.Getenv("R2_BUCKET_NAME")
 
 	if projectID == "" {
 		log.Fatal("GOOGLE_CLOUD_PROJECT_ID environment variable is required")
@@ -214,12 +448,25 @@ func main() {
 	if subscriptionID == "" {
 		log.Fatal("PUBSUB_SUBSCRIPTION_ID environment variable is required")
 	}
+	if r2AccountID == "" {
+		log.Fatal("R2_ACCOUNT_ID environment variable is required")
+	}
+	if r2AccessKey == "" {
+		log.Fatal("R2_ACCESS_KEY_ID environment variable is required")
+	}
+	if r2SecretKey == "" {
+		log.Fatal("R2_SECRET_ACCESS_KEY environment variable is required")
+	}
+	if r2BucketName == "" {
+		log.Fatal("R2_BUCKET_NAME environment variable is required")
+	}
 
-	worker, err := NewVideoWorker(ctx, projectID, credentialsPath)
+	worker, err := NewVideoWorker(ctx, projectID, credentialsPath, r2AccountID, r2AccessKey, r2SecretKey, r2BucketName)
 	if err != nil {
 		log.Fatalf("Failed to create video worker: %v", err)
 	}
 	defer worker.pubsubClient.Close()
+	defer worker.firestoreClient.Close()
 
 	log.Printf("Starting video worker with subscription: %s", subscriptionID)
 	if err := worker.StartProcessing(ctx, subscriptionID); err != nil {
