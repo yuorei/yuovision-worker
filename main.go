@@ -114,20 +114,60 @@ func NewVideoWorker(ctx context.Context, projectID, credentialsPath, r2AccountID
 	}, nil
 }
 
-func (w *VideoWorker) updateProcessingStatus(ctx context.Context, processingID string, status VideoProcessingStatus, progress int, message *string) error {
+func (w *VideoWorker) updateProcessingStatus(ctx context.Context, processingID, videoID string, status VideoProcessingStatus, progress int, message *string) error {
 	docRef := w.firestoreClient.Collection("video_processing").Doc(processingID)
 
-	updates := []firestore.Update{
-		{Path: "status", Value: string(status)},
-		{Path: "progress", Value: progress},
-		{Path: "updated_at", Value: time.Now()},
+	// Check if document exists first
+	doc, err := docRef.Get(ctx)
+	if err != nil && status == VideoProcessingStatusProcessing {
+		// Document doesn't exist, create it with initial data
+		initialData := map[string]any{
+			"id":         processingID,
+			"video_id":   videoID,
+			"status":     string(status),
+			"progress":   progress,
+			"created_at": time.Now(),
+			"updated_at": time.Now(),
+		}
+		if message != nil {
+			initialData["message"] = *message
+		}
+
+		_, err = docRef.Set(ctx, initialData)
+		if err != nil {
+			return fmt.Errorf("failed to create processing status document: %w", err)
+		}
+		log.Printf("Created processing status document for %s: %s (%d%%)", processingID, status, progress)
+		return nil
+	}
+
+	// Document exists or we're not creating it, update with merge
+	data := map[string]any{
+		"status":     string(status),
+		"progress":   progress,
+		"updated_at": time.Now(),
 	}
 
 	if message != nil {
-		updates = append(updates, firestore.Update{Path: "message", Value: *message})
+		data["message"] = *message
 	}
 
-	_, err := docRef.Update(ctx, updates)
+	// If document exists, include video_id and created_at from existing doc
+	if err == nil && doc.Exists() {
+		if existingVideoID, ok := doc.Data()["video_id"]; ok {
+			data["video_id"] = existingVideoID
+		} else {
+			data["video_id"] = videoID
+		}
+		if createdAt, ok := doc.Data()["created_at"]; ok {
+			data["created_at"] = createdAt
+		}
+		if docID, ok := doc.Data()["id"]; ok {
+			data["id"] = docID
+		}
+	}
+
+	_, err = docRef.Set(ctx, data, firestore.MergeAll)
 	if err != nil {
 		return fmt.Errorf("failed to update processing status: %w", err)
 	}
@@ -191,7 +231,7 @@ func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessa
 	log.Printf("Processing video: %s (ProcessingID: %s) for user: %s", msg.VideoID, msg.ProcessingID, msg.UploaderID)
 
 	// Update status to PROCESSING
-	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusProcessing, 10, nil); err != nil {
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusProcessing, 10, nil); err != nil {
 		log.Printf("Failed to update status to PROCESSING: %v", err)
 	}
 
@@ -199,7 +239,7 @@ func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessa
 	tempDir := fmt.Sprintf("/tmp/video_%s", msg.VideoID)
 	if err := os.MkdirAll(tempDir, 0755); err != nil {
 		errMsg := fmt.Sprintf("Failed to create temp directory: %v", err)
-		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 0, &errMsg)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusFailed, 0, &errMsg)
 		return fmt.Errorf("failed to create temp directory: %w", err)
 	}
 	defer os.RemoveAll(tempDir)
@@ -208,12 +248,12 @@ func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessa
 	inputPath := filepath.Join(tempDir, "input.mp4")
 	if err := w.downloadFromR2(ctx, msg.VideoKey, inputPath); err != nil {
 		errMsg := fmt.Sprintf("Failed to download video: %v", err)
-		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 10, &errMsg)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusFailed, 10, &errMsg)
 		return fmt.Errorf("failed to download video: %w", err)
 	}
 
 	// Update progress
-	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusProcessing, 25, nil); err != nil {
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusProcessing, 25, nil); err != nil {
 		log.Printf("Failed to update progress: %v", err)
 	}
 
@@ -221,18 +261,18 @@ func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessa
 	outputDir := filepath.Join(tempDir, "hls")
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		errMsg := fmt.Sprintf("Failed to create output directory: %v", err)
-		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 25, &errMsg)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusFailed, 25, &errMsg)
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
 	if err := w.convertToHLS(inputPath, outputDir); err != nil {
 		errMsg := fmt.Sprintf("Failed to convert to HLS: %v", err)
-		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 40, &errMsg)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusFailed, 40, &errMsg)
 		return fmt.Errorf("failed to convert to HLS: %w", err)
 	}
 
 	// Update progress
-	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusProcessing, 70, nil); err != nil {
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusProcessing, 70, nil); err != nil {
 		log.Printf("Failed to update progress: %v", err)
 	}
 
@@ -244,7 +284,7 @@ func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessa
 	}
 
 	// Update progress
-	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusProcessing, 80, nil); err != nil {
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusProcessing, 80, nil); err != nil {
 		log.Printf("Failed to update progress: %v", err)
 	}
 
@@ -252,7 +292,7 @@ func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessa
 	hlsPrefix := fmt.Sprintf("videos/%s/hls/", msg.VideoID)
 	if err := w.uploadHLSFiles(ctx, outputDir, hlsPrefix); err != nil {
 		errMsg := fmt.Sprintf("Failed to upload HLS files: %v", err)
-		w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusFailed, 80, &errMsg)
+		w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusFailed, 80, &errMsg)
 		return fmt.Errorf("failed to upload HLS files: %w", err)
 	}
 
@@ -272,7 +312,7 @@ func (w *VideoWorker) ProcessVideo(ctx context.Context, msg VideoProcessingMessa
 
 	// Update status to COMPLETED
 	successMsg := "Video processing completed successfully"
-	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, VideoProcessingStatusCompleted, 100, &successMsg); err != nil {
+	if err := w.updateProcessingStatus(ctx, msg.ProcessingID, msg.VideoID, VideoProcessingStatusCompleted, 100, &successMsg); err != nil {
 		log.Printf("Failed to update status to COMPLETED: %v", err)
 	}
 
@@ -380,16 +420,16 @@ func (w *VideoWorker) generateThumbnail(inputPath, outputPath string) error {
 func (w *VideoWorker) StartProcessing(ctx context.Context, subscriptionID string) error {
 	log.Printf("Starting processing with subscription: %s", subscriptionID)
 	sub := w.pubsubClient.Subscription(subscriptionID)
-	
+
 	// Check subscription configuration
 	config, err := sub.Config(ctx)
 	if err != nil {
 		log.Printf("Failed to get subscription config: %v", err)
 		return fmt.Errorf("failed to get subscription config: %w", err)
 	}
-	
+
 	log.Printf("Subscription config - Topic: %s, Push Config: %+v", config.Topic, config.PushConfig)
-	
+
 	if config.PushConfig.Endpoint != "" {
 		log.Printf("WARNING: Subscription is configured for Push delivery (endpoint: %s), but worker expects Pull", config.PushConfig.Endpoint)
 		return fmt.Errorf("subscription %s is configured for Push delivery, not Pull", subscriptionID)
@@ -398,7 +438,7 @@ func (w *VideoWorker) StartProcessing(ctx context.Context, subscriptionID string
 	log.Printf("Starting to receive messages from subscription: %s", subscriptionID)
 	return sub.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
 		log.Printf("Received message - ID: %s, Data length: %d", msg.ID, len(msg.Data))
-		
+
 		var videoMsg VideoProcessingMessage
 		if err := json.Unmarshal(msg.Data, &videoMsg); err != nil {
 			log.Printf("Failed to unmarshal message %s: %v", msg.ID, err)
@@ -477,9 +517,9 @@ func main() {
 	defer worker.firestoreClient.Close()
 
 	log.Printf("Starting video worker with subscription: %s", subscriptionID)
-	log.Printf("Environment variables - Project: %s, Subscription: %s, R2 Account: %s, R2 Bucket: %s", 
+	log.Printf("Environment variables - Project: %s, Subscription: %s, R2 Account: %s, R2 Bucket: %s",
 		projectID, subscriptionID, r2AccountID, r2BucketName)
-	
+
 	if err := worker.StartProcessing(ctx, subscriptionID); err != nil {
 		log.Printf("Video worker error: %v", err)
 		log.Fatalf("Video worker error: %v", err)
