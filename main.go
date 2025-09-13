@@ -378,24 +378,44 @@ func (w *VideoWorker) generateThumbnail(inputPath, outputPath string) error {
 }
 
 func (w *VideoWorker) StartProcessing(ctx context.Context, subscriptionID string) error {
+	log.Printf("Starting processing with subscription: %s", subscriptionID)
 	sub := w.pubsubClient.Subscription(subscriptionID)
+	
+	// Check subscription configuration
+	config, err := sub.Config(ctx)
+	if err != nil {
+		log.Printf("Failed to get subscription config: %v", err)
+		return fmt.Errorf("failed to get subscription config: %w", err)
+	}
+	
+	log.Printf("Subscription config - Topic: %s, Push Config: %+v", config.Topic, config.PushConfig)
+	
+	if config.PushConfig.Endpoint != "" {
+		log.Printf("WARNING: Subscription is configured for Push delivery (endpoint: %s), but worker expects Pull", config.PushConfig.Endpoint)
+		return fmt.Errorf("subscription %s is configured for Push delivery, not Pull", subscriptionID)
+	}
 
+	log.Printf("Starting to receive messages from subscription: %s", subscriptionID)
 	return sub.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
+		log.Printf("Received message - ID: %s, Data length: %d", msg.ID, len(msg.Data))
+		
 		var videoMsg VideoProcessingMessage
 		if err := json.Unmarshal(msg.Data, &videoMsg); err != nil {
-			log.Printf("Failed to unmarshal message: %v", err)
+			log.Printf("Failed to unmarshal message %s: %v", msg.ID, err)
+			log.Printf("Message data: %s", string(msg.Data))
 			msg.Nack()
 			return
 		}
 
+		log.Printf("Processing video message: %+v", videoMsg)
 		if err := w.ProcessVideo(ctx, videoMsg); err != nil {
-			log.Printf("Failed to process video %s: %v", videoMsg.VideoID, err)
+			log.Printf("Failed to process video %s (message %s): %v", videoMsg.VideoID, msg.ID, err)
 			msg.Nack()
 			return
 		}
 
 		msg.Ack()
-		log.Printf("Successfully processed video: %s", videoMsg.VideoID)
+		log.Printf("Successfully processed video: %s (message %s)", videoMsg.VideoID, msg.ID)
 	})
 }
 
@@ -457,7 +477,11 @@ func main() {
 	defer worker.firestoreClient.Close()
 
 	log.Printf("Starting video worker with subscription: %s", subscriptionID)
+	log.Printf("Environment variables - Project: %s, Subscription: %s, R2 Account: %s, R2 Bucket: %s", 
+		projectID, subscriptionID, r2AccountID, r2BucketName)
+	
 	if err := worker.StartProcessing(ctx, subscriptionID); err != nil {
+		log.Printf("Video worker error: %v", err)
 		log.Fatalf("Video worker error: %v", err)
 	}
 }
