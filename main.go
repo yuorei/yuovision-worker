@@ -465,6 +465,7 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	log.Printf("Video worker started successfully")
 	ctx := context.Background()
 
 	port := os.Getenv("PORT")
